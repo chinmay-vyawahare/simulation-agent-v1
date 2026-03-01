@@ -1,15 +1,8 @@
 """
 Simulation Agent — Main LangGraph definition.
 
-Assembles the Orchestrator → Planner → Traversal → Response pipeline
-with conditional edges for re-planning on failures.
-
 Graph Flow:
-    START → discover_schema → planner → traversal → orchestrator
-                ↑                                        ↓
-                └──── (re-plan) ─────────────────────────┘
-                                                         ↓
-                                                     response → END
+    START → discover_schema → traversal (autonomous ReAct) → response → END
 """
 from __future__ import annotations
 
@@ -20,9 +13,7 @@ from langgraph.graph import StateGraph, START, END
 
 from models.state import SimulationState
 from agents.schema_discovery import discover_schema_node
-from agents.planner import planner_node
 from agents.traversal import traversal_node
-from agents.orchestrator import orchestrator_node, route_after_orchestrator
 from agents.response import response_node
 
 logger = logging.getLogger(__name__)
@@ -40,38 +31,13 @@ def build_simulation_graph() -> StateGraph:
 
     # ── Add nodes ──
     graph.add_node("discover_schema", discover_schema_node)
-    graph.add_node("planner", planner_node)
     graph.add_node("traversal", traversal_node)
-    graph.add_node("orchestrator", orchestrator_node)
     graph.add_node("response", response_node)
 
     # ── Add edges ──
-
-    # START → schema discovery
     graph.add_edge(START, "discover_schema")
-
-    # Schema discovery → planner (always)
-    graph.add_edge("discover_schema", "planner")
-
-    # Planner → traversal (always, after creating plan)
-    graph.add_edge("planner", "traversal")
-
-    # Traversal → orchestrator (always, for evaluation)
-    graph.add_edge("traversal", "orchestrator")
-
-    # Orchestrator → conditional routing
-    graph.add_conditional_edges(
-        "orchestrator",
-        route_after_orchestrator,
-        {
-            "planning": "planner",     # Re-plan on failures
-            "response": "response",    # Proceed to response
-            "error": "response",       # Error → still generate response with what we have
-            "complete": END,
-        },
-    )
-
-    # Response → END
+    graph.add_edge("discover_schema", "traversal")
+    graph.add_edge("traversal", "response")
     graph.add_edge("response", END)
 
     # ── Compile ──
@@ -81,12 +47,13 @@ def build_simulation_graph() -> StateGraph:
     return compiled
 
 
-def run_simulation(query: str) -> dict:
+def run_simulation(query: str, max_steps: int = 15) -> dict:
     """
     Convenience function: run a simulation query end-to-end.
 
     Args:
-        query: The user's simulation question (e.g., "Complete 300 sites in Chicago in 2 weeks")
+        query: The user's simulation question
+        max_steps: Maximum number of tool calls for the traversal agent
 
     Returns:
         The final state dict with all results.
@@ -95,13 +62,12 @@ def run_simulation(query: str) -> dict:
 
     initial_state: SimulationState = {
         "user_query": query,
-        "current_phase": "planning",
-        "iteration": 0,
-        "plan": [],
-        "plan_reasoning": "",
+        "current_phase": "discovery",
         "kg_schema": "",
-        "execution_results": [],
-        "pending_steps": [],
+        "traversal_findings": "",
+        "traversal_tool_calls": [],
+        "traversal_steps_taken": 0,
+        "max_traversal_steps": max_steps,
         "final_response": "",
         "calculations": "",
         "data_summary": {},

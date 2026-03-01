@@ -1,5 +1,5 @@
 """
-Response Agent — Interprets traversal results, performs calculations
+Response Agent — Interprets traversal findings, performs calculations
 via Python sandbox, and generates a PM-readable response.
 """
 from __future__ import annotations
@@ -19,44 +19,35 @@ from prompts.agent_prompts import RESPONSE_SYSTEM
 logger = logging.getLogger(__name__)
 
 
-def _format_execution_data(state: SimulationState) -> str:
-    """Format all execution results into a readable context for the LLM."""
-    plan = state.get("plan", [])
-    results = state.get("execution_results", [])
+def _format_traversal_data(state: SimulationState) -> str:
+    """Format traversal agent findings and tool call log for the response LLM."""
+    lines = ["## Traversal Agent Findings\n"]
 
-    # Map step_id → step info
-    steps_by_id = {s["step_id"]: s for s in plan}
+    # Main findings summary from the agent's final message
+    findings = state.get("traversal_findings", "")
+    if findings:
+        lines.append(findings)
+    else:
+        lines.append("No findings were recorded by the traversal agent.")
 
-    # Map step_id → result
-    results_by_id = {}
-    for r in results:
-        # Keep latest result per step (in case of retries)
-        results_by_id[r["step_id"]] = r
-
-    lines = ["## Collected Data from Knowledge Graph Traversal\n"]
-
-    for step_id in sorted(results_by_id.keys()):
-        result = results_by_id[step_id]
-        step = steps_by_id.get(step_id, {})
-
-        status_icon = "✅" if result["status"] == "success" else "❌"
-        lines.append(f"### Step {step_id}: {step.get('description', 'Unknown')} {status_icon}")
-        lines.append(f"**Purpose**: {step.get('purpose', 'N/A')}")
-        lines.append(f"**Action**: {step.get('action', 'N/A')}")
-
-        if result["status"] == "success" and result.get("data") is not None:
-            data = result["data"]
-            # Truncate large datasets
-            data_str = json.dumps(data, default=str, indent=2)
-            if len(data_str) > 3000:
-                data_str = data_str[:3000] + "\n... (truncated)"
-            lines.append(f"**Data**:\n```json\n{data_str}\n```")
-        elif result.get("error"):
-            lines.append(f"**Error**: {result['error']}")
-        else:
-            lines.append("**Data**: No results returned")
-
-        lines.append("")
+    # Tool call log (abbreviated for context window efficiency)
+    tool_calls = state.get("traversal_tool_calls", [])
+    if tool_calls:
+        lines.append(f"\n## Tool Call Log ({len(tool_calls)} calls)\n")
+        for i, tc in enumerate(tool_calls, 1):
+            status_icon = "OK" if tc["status"] == "success" else "ERROR"
+            lines.append(f"### Call {i}: {tc['tool_name']} [{status_icon}]")
+            # Show input
+            input_str = json.dumps(tc["tool_input"], default=str)
+            if len(input_str) > 300:
+                input_str = input_str[:300] + "..."
+            lines.append(f"**Input**: {input_str}")
+            # Show output (truncated)
+            output_str = str(tc["tool_output"])
+            if len(output_str) > 1500:
+                output_str = output_str[:1500] + "\n... (truncated)"
+            lines.append(f"**Output**: {output_str}")
+            lines.append("")
 
     return "\n".join(lines)
 
@@ -65,7 +56,7 @@ def response_node(state: SimulationState) -> dict[str, Any]:
     """
     LangGraph node: Response Agent.
 
-    Reads: user_query, plan, execution_results, plan_reasoning
+    Reads: user_query, traversal_findings, traversal_tool_calls, errors
     Writes: final_response, calculations, data_summary, current_phase, messages
     """
     llm = ChatOpenAI(
@@ -75,12 +66,11 @@ def response_node(state: SimulationState) -> dict[str, Any]:
     )
 
     # Build context
-    data_context = _format_execution_data(state)
+    data_context = _format_traversal_data(state)
     errors = state.get("errors", [])
 
     user_message_parts = [
         f"## Original User Query\n{state['user_query']}",
-        f"\n## Plan Reasoning\n{state.get('plan_reasoning', 'N/A')}",
         f"\n{data_context}",
     ]
 
@@ -115,11 +105,15 @@ def response_node(state: SimulationState) -> dict[str, Any]:
         for block in code_blocks[1:]:
             code = block.split("```")[0].strip()
             if code:
-                # Build context from execution results
+                # Build context from tool call outputs
                 exec_context = {}
-                for r in state.get("execution_results", []):
-                    if r["status"] == "success":
-                        exec_context[f"step_{r['step_id']}_data"] = r["data"]
+                for i, tc in enumerate(state.get("traversal_tool_calls", [])):
+                    if tc["status"] == "success" and tc["tool_output"]:
+                        try:
+                            parsed = json.loads(tc["tool_output"])
+                            exec_context[f"call_{i}_{tc['tool_name']}"] = parsed
+                        except (json.JSONDecodeError, TypeError):
+                            exec_context[f"call_{i}_{tc['tool_name']}"] = tc["tool_output"]
 
                 calc_result = execute_python(code, exec_context)
                 if calc_result["status"] == "success":
@@ -131,11 +125,15 @@ def response_node(state: SimulationState) -> dict[str, Any]:
                         f"Result: {result_val}\n\n"
                     )
 
-    # Build data summary from successful results
-    data_summary = {}
-    for r in state.get("execution_results", []):
-        if r["status"] == "success" and r.get("data"):
-            data_summary[f"step_{r['step_id']}"] = r["data"]
+    # Build data summary from successful tool calls
+    data_summary: dict[str, Any] = {}
+    for i, tc in enumerate(state.get("traversal_tool_calls", [])):
+        if tc["status"] == "success" and tc["tool_output"]:
+            try:
+                parsed = json.loads(tc["tool_output"])
+                data_summary[f"call_{i}_{tc['tool_name']}"] = parsed
+            except (json.JSONDecodeError, TypeError):
+                data_summary[f"call_{i}_{tc['tool_name']}"] = tc["tool_output"]
 
     logger.info("Response agent generated final output")
 

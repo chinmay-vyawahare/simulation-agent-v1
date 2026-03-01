@@ -28,7 +28,7 @@ class SimulateResponse(BaseModel):
     calculations:   str
     errors:         list[str]
     messages:       list[dict[str, Any]]
-    iteration:      int
+    traversal_steps: int
 
 
 # ── BKG ───────────────────────────────────────────────────────────────────────

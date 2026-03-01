@@ -1,7 +1,7 @@
 """
 Schema Discovery node — Discovers the Neo4j knowledge graph schema
 once at the start of each simulation run. This provides context for
-the Planner Agent to write accurate Cypher queries.
+the Traversal Agent to explore the graph effectively.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def discover_schema_node(state: SimulationState) -> dict[str, Any]:
 
         return {
             "kg_schema": schema,
-            "current_phase": "planning",
+            "current_phase": "traversal",
             "messages": [{
                 "agent": "schema_discovery",
                 "content": f"Knowledge graph schema discovered ({len(schema)} chars)",
@@ -35,10 +35,10 @@ def discover_schema_node(state: SimulationState) -> dict[str, Any]:
         }
     except Exception as e:
         logger.error(f"Schema discovery failed: {e}")
-        # Provide a fallback empty schema — planner will work with what it has
+        # Provide a fallback empty schema — traversal agent will work with what it has
         return {
             "kg_schema": f"Schema discovery failed: {e}. Write generic Cypher queries.",
-            "current_phase": "planning",
+            "current_phase": "traversal",
             "errors": [f"Schema discovery error: {e}"],
             "messages": [{
                 "agent": "schema_discovery",

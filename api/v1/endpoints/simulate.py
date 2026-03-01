@@ -14,13 +14,12 @@ router = APIRouter(tags=["Agent"])
 @router.post("/simulate", response_model=SimulateResponse)
 def simulate(req: SimulateRequest):
     """
-    Run a natural-language query through the full LangGraph agent pipeline.
+    Run a natural-language query through the LangGraph agent pipeline.
 
     The agent:
     1. Discovers the KG schema
-    2. Plans Cypher + Python steps
-    3. Executes against Neo4j / PostgreSQL
-    4. Synthesises a PM-ready response
+    2. Autonomously explores the graph using tools
+    3. Synthesises a PM-ready response
 
     Returns the final response, structured data summary, and execution trace.
     """

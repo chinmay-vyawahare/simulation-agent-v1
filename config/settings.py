@@ -26,7 +26,7 @@ class LLMConfig:
 class AppConfig:
     neo4j: Neo4jConfig = field(default_factory=Neo4jConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
-    max_traversal_steps: int = 10
+    max_traversal_steps: int = 15
     max_retries: int = 3
     verbose: bool = True
 

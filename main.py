@@ -49,6 +49,11 @@ def print_result(state: dict):
         print("\n── Calculation Trace ──")
         print(state["calculations"])
 
+    # Traversal summary
+    steps = state.get("traversal_steps_taken", 0)
+    if steps:
+        print(f"\n── Traversal: {steps} tool calls ──")
+
     # Execution trace
     print("\n── Execution Trace ──")
     messages = state.get("messages", [])

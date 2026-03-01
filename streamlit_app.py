@@ -50,7 +50,7 @@ with st.sidebar:
 if tool == "🤖 Agent":
     st.title("Run Simulation")
     st.markdown(
-        "Ask a natural-language question. The agent plans, queries Neo4j/PostgreSQL, "
+        "Ask a natural-language question. The agent autonomously explores Neo4j/PostgreSQL "
         "and returns a PM-ready answer."
     )
 
@@ -118,7 +118,7 @@ if tool == "🤖 Agent":
                         st.text(f"[{agent:>25}]  {content}")
                 else:
                     st.info("No execution log.")
-                st.caption(f"Iterations: {data.get('iteration', 0)}")
+                st.caption(f"Traversal steps: {data.get('traversal_steps', 0)}")
 
 # # ── BKG Explorer ─────────────────────────────────────────────────────────────
 # elif tool == "🔍 BKG Explorer":

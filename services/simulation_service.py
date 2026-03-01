@@ -32,5 +32,5 @@ def run_query(query: str) -> dict:
         "calculations":   state.get("calculations", ""),
         "errors":         state.get("errors", []),
         "messages":       state.get("messages", []),
-        "iteration":      state.get("iteration", 0),
+        "traversal_steps": state.get("traversal_steps_taken", 0),
     }

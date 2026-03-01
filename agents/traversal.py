@@ -1,256 +1,262 @@
 """
-Traversal Agent — Executes plan steps against the Neo4j knowledge graph
-and Python sandbox. Handles retries and error recovery.
+Traversal Agent — Autonomous ReAct agent that explores the Neo4j
+Knowledge Graph using tools to gather data needed to answer the
+user's query.
 """
 from __future__ import annotations
 
 import json
 import time
 import logging
+import warnings
 from typing import Any
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from langgraph.prebuilt import create_react_agent
 
 from config.settings import config
-from models.state import SimulationState, ExecutionResult
-from tools.neo4j_tool import neo4j_tool
-from tools.python_sandbox import execute_python
+from models.state import SimulationState, ToolCallRecord
+from tools.langchain_tools import get_all_tools
 from prompts.agent_prompts import TRAVERSAL_SYSTEM
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 2
+# Suppress noisy Neo4j deprecation warnings
+logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
+
+DEFAULT_MAX_STEPS = 15
+
+# ─── ANSI colors for terminal output ───
+_CYAN = "\033[96m"
+_GREEN = "\033[92m"
+_YELLOW = "\033[93m"
+_RED = "\033[91m"
+_DIM = "\033[2m"
+_BOLD = "\033[1m"
+_RESET = "\033[0m"
 
 
-def _fix_cypher_with_llm(
-    original_query: str, error: str, schema: str
-) -> str:
-    """Ask the LLM to fix a broken Cypher query."""
-    llm = ChatOpenAI(
-        model=config.llm.model,
-        temperature=0,
-        max_tokens=1024,
-    )
-    response = llm.invoke([
-        SystemMessage(content=(
-            "You are a Neo4j Cypher expert. Fix the following query based on "
-            "the error message and schema. Return ONLY the corrected Cypher query, "
-            "no explanation.\n\n"
-            f"## Schema\n{schema}"
-        )),
-        HumanMessage(content=(
-            f"## Original Query\n```\n{original_query}\n```\n\n"
-            f"## Error\n{error}\n\n"
-            "Return ONLY the fixed Cypher query."
-        )),
-    ])
-    return response.content.strip().strip("`").strip()
+def _print_divider(char: str = "─", width: int = 70):
+    print(f"{_DIM}{char * width}{_RESET}")
 
 
-def _execute_cypher_step(
-    step: dict, schema: str
-) -> ExecutionResult:
-    """Execute a Cypher query step with retry logic."""
-    query = step["query_or_code"]
-    start = time.perf_counter()
+def _print_tool_call(step_num: int, tool_name: str, tool_input: dict):
+    """Print a tool call in a readable format."""
+    _print_divider()
+    print(f"{_BOLD}{_CYAN}  🔧 Step {step_num}: {tool_name}{_RESET}")
 
-    for attempt in range(MAX_RETRIES + 1):
-        result = neo4j_tool.run_cypher_safe(query)
-
-        if result["status"] == "success":
-            elapsed = (time.perf_counter() - start) * 1000
-            return ExecutionResult(
-                step_id=step["step_id"],
-                status="success",
-                data=result["records"],
-                error=None,
-                execution_time_ms=round(elapsed, 2),
-            )
-
-        # Try to fix on retry
-        if attempt < MAX_RETRIES:
-            logger.warning(
-                f"Step {step['step_id']} failed (attempt {attempt + 1}): "
-                f"{result['error']}. Attempting fix..."
-            )
-            query = _fix_cypher_with_llm(query, result["error"], schema)
-            logger.info(f"Fixed query: {query[:200]}")
-        else:
-            elapsed = (time.perf_counter() - start) * 1000
-            return ExecutionResult(
-                step_id=step["step_id"],
-                status="error",
-                data=None,
-                error=result["error"],
-                execution_time_ms=round(elapsed, 2),
-            )
+    # Format input nicely
+    for key, val in tool_input.items():
+        val_str = str(val)
+        if len(val_str) > 200:
+            val_str = val_str[:200] + "..."
+        print(f"     {_DIM}{key}:{_RESET} {val_str}")
 
 
-def _execute_python_step(
-    step: dict, prior_results: dict[int, Any]
-) -> ExecutionResult:
-    """Execute a Python computation step."""
-    code = step["query_or_code"]
-    start = time.perf_counter()
-
-    # Build context from dependent steps
-    context = {}
-    for dep_id in step.get("depends_on", []):
-        if dep_id in prior_results:
-            context[f"step_{dep_id}_data"] = prior_results[dep_id]
-
-    result = execute_python(code, context)
-    elapsed = (time.perf_counter() - start) * 1000
-
-    if result["status"] == "success":
-        return ExecutionResult(
-            step_id=step["step_id"],
-            status="success",
-            data=result.get("result") or result.get("output", ""),
-            error=None,
-            execution_time_ms=round(elapsed, 2),
-        )
+def _print_tool_result(status: str, output: str):
+    """Print a tool result in a readable format."""
+    if status == "error":
+        icon, color = "✗", _RED
     else:
-        return ExecutionResult(
-            step_id=step["step_id"],
-            status="error",
-            data=None,
-            error=result.get("error", "Unknown error"),
-            execution_time_ms=round(elapsed, 2),
-        )
+        icon, color = "✓", _GREEN
+
+    # Try to pretty-print JSON output
+    display = output
+    try:
+        parsed = json.loads(output)
+        if isinstance(parsed, dict):
+            # Show key summary instead of raw JSON dump
+            if "records" in parsed:
+                count = parsed.get("count", len(parsed["records"]))
+                display = f"{count} records returned"
+                if parsed["records"] and count <= 5:
+                    display += "\n" + json.dumps(parsed["records"], indent=2, default=str)
+                elif parsed["records"]:
+                    display += f" (showing first 3)\n" + json.dumps(
+                        parsed["records"][:3], indent=2, default=str
+                    )
+            elif "relevant_nodes" in parsed:
+                nodes = parsed["relevant_nodes"]
+                metrics = parsed.get("relevant_metrics", [])
+                display = f"{len(nodes)} nodes, {len(metrics)} metrics found"
+                for n in nodes[:5]:
+                    display += f"\n     • {n.get('node_id', '?')} — {(n.get('definition') or '')[:80]}"
+            elif "error" in parsed:
+                display = f"Error: {parsed['error']}"
+                status = "error"
+            elif "paths" in parsed:
+                paths = parsed["paths"]
+                display = f"{len(paths)} paths found"
+                for p in paths[:5]:
+                    display += f"\n     • ({p.get('from')})─[:{p.get('relationship')}]→({p.get('to')})"
+            elif "status" in parsed and parsed["status"] == "success":
+                result_val = parsed.get("result", parsed.get("output", ""))
+                display = f"Success: {json.dumps(result_val, default=str)[:300]}"
+            else:
+                display = json.dumps(parsed, indent=2, default=str)
+                if len(display) > 500:
+                    display = display[:500] + "\n     ...(truncated)"
+        else:
+            display = str(parsed)
+            if len(display) > 500:
+                display = display[:500] + "...(truncated)"
+    except (json.JSONDecodeError, TypeError):
+        if len(display) > 500:
+            display = display[:500] + "...(truncated)"
+
+    color_out = _RED if status == "error" else _GREEN
+    print(f"     {color_out}{icon} Result:{_RESET} {display}")
 
 
-def _execute_aggregate_step(
-    step: dict, prior_results: dict[int, Any]
-) -> ExecutionResult:
-    """Aggregate results from multiple prior steps."""
-    start = time.perf_counter()
+def _print_agent_thinking(content: str):
+    """Print the agent's reasoning text."""
+    if not content.strip():
+        return
+    # Truncate very long reasoning
+    text = content.strip()
+    if len(text) > 400:
+        text = text[:400] + "..."
+    print(f"  {_YELLOW}💭 Agent:{_RESET} {text}")
 
-    aggregated = {}
-    for dep_id in step.get("depends_on", []):
-        if dep_id in prior_results:
-            aggregated[f"step_{dep_id}"] = prior_results[dep_id]
 
-    elapsed = (time.perf_counter() - start) * 1000
-    return ExecutionResult(
-        step_id=step["step_id"],
-        status="success",
-        data=aggregated,
-        error=None,
-        execution_time_ms=round(elapsed, 2),
-    )
+def _extract_and_print(messages: list) -> tuple[list[ToolCallRecord], str]:
+    """
+    Walk the agent message history, print each step live-style,
+    and return (tool_call_records, findings).
+    """
+    records: list[ToolCallRecord] = []
+    step_num = 0
+    findings = "No findings extracted."
+
+    print(f"\n{_BOLD}{'═' * 70}")
+    print(f"  🔍 TRAVERSAL AGENT — Exploring Knowledge Graph")
+    print(f"{'═' * 70}{_RESET}\n")
+
+    for msg in messages:
+        # Agent reasoning or final answer
+        if msg.type == "ai":
+            # Print reasoning text (if any, before tool calls)
+            text = getattr(msg, "content", "") or ""
+            if text.strip() and not getattr(msg, "tool_calls", None):
+                _print_agent_thinking(text)
+                findings = text  # Last AI message without tool calls = findings
+
+            # Tool calls
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    step_num += 1
+                    _print_tool_call(step_num, tc["name"], tc["args"])
+                    records.append(ToolCallRecord(
+                        tool_name=tc["name"],
+                        tool_input=tc["args"],
+                        tool_output="",
+                        status="success",
+                        execution_time_ms=0,
+                    ))
+
+        # Tool results
+        elif msg.type == "tool":
+            output = msg.content or ""
+            # Match to the last record with empty output
+            for rec in reversed(records):
+                if rec["tool_output"] == "":
+                    truncated = output[:2000] + "...(truncated)" if len(output) > 2000 else output
+                    rec["tool_output"] = truncated
+                    if "error" in output.lower()[:200]:
+                        rec["status"] = "error"
+                    _print_tool_result(rec["status"], truncated)
+                    break
+
+    _print_divider("═")
+    print(f"  {_BOLD}✅ Traversal complete: {step_num} tool calls{_RESET}")
+    _print_divider("═")
+    print()
+
+    return records, findings
 
 
 def traversal_node(state: SimulationState) -> dict[str, Any]:
     """
-    LangGraph node: Traversal Agent.
+    LangGraph node: Autonomous Traversal Agent.
 
-    Reads: plan, pending_steps, kg_schema, execution_results
-    Writes: execution_results, pending_steps, current_phase, messages
+    Reads: user_query, kg_schema, max_traversal_steps
+    Writes: traversal_findings, traversal_tool_calls, traversal_steps_taken,
+            current_phase, messages, errors
     """
-    plan = state.get("plan", [])
-    schema = state.get("kg_schema", "")
-    prior_exec = state.get("execution_results", [])
+    # Suppress pandas SQLAlchemy warnings
+    warnings.filterwarnings("ignore", message=".*pandas only supports SQLAlchemy.*")
 
-    # Build lookup of already-executed results
-    prior_results: dict[int, Any] = {}
-    for r in prior_exec:
-        if r["status"] == "success":
-            prior_results[r["step_id"]] = r["data"]
+    llm = ChatOpenAI(
+        model=config.llm.model,
+        temperature=config.llm.temperature,
+        max_tokens=config.llm.max_tokens,
+    )
 
-    # Sort steps by dependency order
-    pending_ids = set(state.get("pending_steps", [s["step_id"] for s in plan]))
-    steps_by_id = {s["step_id"]: s for s in plan}
+    # Build system prompt with KG schema injected
+    kg_schema = state.get("kg_schema", "Schema not available")
+    system_prompt = TRAVERSAL_SYSTEM.format(kg_schema=kg_schema)
 
-    new_results: list[ExecutionResult] = []
-    executed_ids: set[int] = set()
-    errors: list[str] = []
+    max_steps = state.get("max_traversal_steps", DEFAULT_MAX_STEPS)
 
-    # Simple topological execution
-    max_iterations = len(plan) + 5  # Safety bound
-    iteration = 0
+    # Create the ReAct agent with all available tools
+    tools = get_all_tools()
+    agent = create_react_agent(
+        model=llm,
+        tools=tools,
+        prompt=system_prompt,
+    )
 
-    while pending_ids and iteration < max_iterations:
-        iteration += 1
-        progress = False
+    print(f"\n{_DIM}  Query: {state['user_query']}{_RESET}")
+    print(f"{_DIM}  Max steps: {max_steps} | Model: {config.llm.model}{_RESET}")
 
-        for step_id in sorted(pending_ids):
-            step = steps_by_id.get(step_id)
-            if not step:
-                pending_ids.discard(step_id)
-                continue
+    # Invoke the agent
+    start_time = time.perf_counter()
+    try:
+        result = agent.invoke(
+            {"messages": [("human", state["user_query"])]},
+            config={"recursion_limit": max_steps * 2 + 5},
+        )
 
-            # Check dependencies are met
-            deps = set(step.get("depends_on", []))
-            completed_ids = set(prior_results.keys()) | executed_ids
-            if not deps.issubset(completed_ids):
-                continue  # Dependencies not yet met
+        elapsed = time.perf_counter() - start_time
+        agent_messages = result.get("messages", [])
 
-            logger.info(
-                f"Executing step {step_id}: {step['action']} — {step['description']}"
-            )
+        # Extract + print all tool calls and reasoning
+        tool_call_records, findings = _extract_and_print(agent_messages)
+        steps_taken = len(tool_call_records)
 
-            # Route to appropriate executor
-            if step["action"] == "cypher_query":
-                result = _execute_cypher_step(step, schema)
-            elif step["action"] == "python_compute":
-                # Merge prior + newly executed results
-                all_results = {**prior_results}
-                for r in new_results:
-                    if r["status"] == "success":
-                        all_results[r["step_id"]] = r["data"]
-                result = _execute_python_step(step, all_results)
-            elif step["action"] == "aggregate":
-                all_results = {**prior_results}
-                for r in new_results:
-                    if r["status"] == "success":
-                        all_results[r["step_id"]] = r["data"]
-                result = _execute_aggregate_step(step, all_results)
-            else:
-                result = ExecutionResult(
-                    step_id=step_id,
-                    status="error",
-                    data=None,
-                    error=f"Unknown action: {step['action']}",
-                    execution_time_ms=0,
-                )
+        print(f"  {_DIM}Total time: {elapsed:.1f}s{_RESET}\n")
 
-            new_results.append(result)
-            pending_ids.discard(step_id)
-            executed_ids.add(step_id)
+        logger.info(
+            "Traversal agent completed: %d tool calls in %.1fs",
+            steps_taken, elapsed,
+        )
 
-            if result["status"] == "success":
-                prior_results[step_id] = result["data"]
-            else:
-                errors.append(
-                    f"Step {step_id} ({step['description']}): {result.get('error')}"
-                )
+        return {
+            "traversal_findings": findings,
+            "traversal_tool_calls": tool_call_records,
+            "traversal_steps_taken": steps_taken,
+            "current_phase": "response",
+            "messages": [{
+                "agent": "traversal",
+                "content": (
+                    f"Autonomous exploration complete: {steps_taken} tool calls, "
+                    f"{elapsed:.1f}s elapsed"
+                ),
+            }],
+        }
 
-            progress = True
-
-        if not progress:
-            # Deadlock — remaining steps have unmet dependencies
-            for sid in pending_ids:
-                errors.append(f"Step {sid}: unmet dependencies, skipped")
-            break
-
-    # Summarize
-    success_count = sum(1 for r in new_results if r["status"] == "success")
-    total = len(new_results)
-
-    logger.info(f"Traversal complete: {success_count}/{total} steps succeeded")
-
-    return {
-        "execution_results": new_results,
-        "pending_steps": list(pending_ids),
-        "current_phase": "response",
-        "errors": errors,
-        "messages": [{
-            "agent": "traversal",
-            "content": (
-                f"Executed {total} steps: {success_count} succeeded, "
-                f"{total - success_count} failed"
-            ),
-        }],
-    }
+    except Exception as e:
+        elapsed = time.perf_counter() - start_time
+        print(f"\n  {_RED}✗ Traversal failed after {elapsed:.1f}s: {e}{_RESET}\n")
+        logger.error("Traversal agent failed: %s", e)
+        return {
+            "traversal_findings": f"Traversal failed: {e}",
+            "traversal_tool_calls": [],
+            "traversal_steps_taken": 0,
+            "current_phase": "response",
+            "errors": [f"Traversal agent error: {e}"],
+            "messages": [{
+                "agent": "traversal",
+                "content": f"Traversal failed after {elapsed:.1f}s: {e}",
+            }],
+        }
